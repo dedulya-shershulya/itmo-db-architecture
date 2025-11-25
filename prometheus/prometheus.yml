@@ -1,0 +1,10 @@
+global:
+  scrape_interval: 10s 
+
+scrape_configs:
+  - job_name: "postgres-exporter"
+    static_configs:
+      - targets: ["postgres-exporter:9187"]
+  - job_name: 'query-simulator'
+    static_configs:
+      - targets: ['query-simulator:8000']  

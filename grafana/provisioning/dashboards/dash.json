@@ -1,0 +1,20 @@
+{
+  "title": "Query Performance",
+  "panels": [
+    {
+      "type": "graph",
+      "title": "Average Query Duration",
+      "gridPos": { "x": 0, "y": 8, "w": 20, "h": 15 },
+      "options": {
+        "drawStyle": "line",
+        "lineInterpolation": "smooth",
+        "fillOpacity": 10,
+        "showPoints": "never"
+      },
+      "targets": [{
+        "expr": "rate(query_duration_seconds_sum[1m]) / rate(query_duration_seconds_count[1m])",
+        "legendFormat": "{{query_name}}"
+      }]
+    }
+  ]
+}

@@ -1,0 +1,235 @@
+
+services:  
+  
+  etcd1: &etcd
+    image: patroni
+    networks: [app-network]
+    environment:
+      ETCD_LISTEN_PEER_URLS: http://0.0.0.0:2380
+      ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+      ETCD_INITIAL_CLUSTER: etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
+      ETCD_INITIAL_CLUSTER_STATE: new
+      ETCD_INITIAL_CLUSTER_TOKEN: tutorial
+      ETCD_UNSUPPORTED_ARCH: arm64
+    container_name: demo-etcd1
+    hostname: etcd1
+    command: etcd --name etcd1 --initial-advertise-peer-urls http://etcd1:2380
+
+  etcd2:
+    <<: *etcd
+    container_name: demo-etcd2
+    hostname: etcd2
+    command: etcd --name etcd2 --initial-advertise-peer-urls http://etcd2:2380
+
+  etcd3:
+    <<: *etcd
+    container_name: demo-etcd3
+    hostname: etcd3
+    command: etcd --name etcd3 --initial-advertise-peer-urls http://etcd3:2380
+
+  haproxy:
+    image: patroni
+    networks: [app-network]
+    env_file: patroni.env
+    hostname: haproxy
+    container_name: demo-haproxy
+    ports:
+      - "15000:5000"
+      - "15001:5001"
+    command: haproxy
+    environment: &haproxy_env
+      ETCDCTL_ENDPOINTS: http://etcd1:2379,http://etcd2:2379,http://etcd3:2379
+      PATRONI_ETCD3_HOSTS: "'etcd1:2379','etcd2:2379','etcd3:2379'"
+      PATRONI_SCOPE: patroni
+
+  patroni1:
+    image: patroni
+    networks: [app-network]
+    env_file: patroni.env
+    hostname: patroni1
+    container_name: demo-patroni1
+    environment:
+      <<: *haproxy_env
+      PATRONI_NAME: patroni1
+
+  patroni2:
+    image: patroni
+    networks: [app-network]
+    env_file: patroni.env
+    hostname: patroni2
+    container_name: demo-patroni2
+    environment:
+      <<: *haproxy_env
+      PATRONI_NAME: patroni2
+
+  patroni3:
+    image: patroni
+    networks: [app-network]
+    env_file: patroni.env
+    hostname: patroni3
+    container_name: demo-patroni3
+    environment:
+      <<: *haproxy_env
+      PATRONI_NAME: patroni3
+  
+  init:
+    image: postgres:16
+    container_name: init
+    networks: [app-network]
+    volumes:
+      - ./db/init:/init_scripts
+    env_file:
+      - .env
+    depends_on:
+      haproxy:
+        condition: service_started
+    environment:
+      PGHOST: haproxy
+      PGPORT: 5000
+    entrypoint: >
+      bash -c "
+      echo 'Waiting for PostgreSQL cluster to be ready...';
+      until pg_isready -h $${PGHOST} -p $${PGPORT}; do sleep 2; done;
+      echo 'Cluster is ready. Creating database and user...';
+      run-parts --regex '\.sh$' /init_scripts --exit-on-error;"
+
+  flyway:
+    image: flyway/flyway
+    container_name: flyway
+    env_file: .env
+    environment:
+      FLYWAY_USER: ${DB_ADMIN_USER}
+      FLYWAY_PASSWORD: ${DB_ADMIN_PASSWORD}
+      DB_NAME: ${DB_NAME}
+      MIGRATION_VERSION: ${MIGRATION_VERSION:-latest}
+    volumes:
+      - ./flyway.conf:/flyway/conf/flyway.conf
+      - ./db/migrations/up:/flyway/sql
+    command: migrate
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    networks:
+      - app-network
+
+  seeder:
+    build: ./db/seed 
+    container_name: seeder
+    env_file: .env
+    environment:
+      APP_ENV: ${APP_ENV:-prod}
+      SEED_COUNT: ${SEED_COUNT:-100}
+    volumes:
+      - ./db/seed:/app
+    depends_on:
+      flyway:
+        condition: service_completed_successfully
+    networks:
+      - app-network
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter
+    container_name: postgres-exporter
+    env_file: .env
+    environment:
+      DATA_SOURCE_NAME: "postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/${DB_NAME}?sslmode=disable"
+    ports:
+      - "9187:9187"
+    networks:
+      - app-network
+    depends_on:
+      - haproxy
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+    networks:
+      - app-network
+    depends_on:
+      - postgres-exporter
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: "admin"
+      GF_SECURITY_ADMIN_PASSWORD: "admin"
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - grafana_data:/var/lib/grafana
+    networks:
+      - app-network
+    depends_on:
+      - prometheus
+
+  query-simulator:
+    build: ./query-simulator
+    container_name: query_simulator
+    env_file: .env
+    environment:
+      DB_NAME: ${DB_NAME}
+      DB_USER: ${POSTGRES_APP_USER}
+      DB_PASSWORD: ${POSTGRES_APP_PASSWORD}
+    ports:
+      - "8000:8000"
+    networks:
+      - app-network
+    depends_on:
+      seeder:
+        condition: service_completed_successfully
+      haproxy:
+        condition: service_started
+
+  postgres-backup:
+    build: ./backup  
+    container_name: postgres-backup
+    env_file: .env
+    environment:
+      BACKUP_RETENTION_COUNT: ${BACKUP_RETENTION_COUNT:-7}
+      BACKUP_INTERVAL_CRON: ${BACKUP_INTERVAL_CRON:-"0 3 * * *"}
+      POSTGRES_HOST: ${POSTGRES_HOST:-haproxy}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5000}
+    volumes:
+      - ./backup/backups:/backups
+    depends_on:
+      flyway:
+        condition: service_completed_successfully
+    networks:
+      - app-network
+  
+
+  migration-tester:
+    image: postgres:16
+    container_name: migration_tester
+    volumes:
+      - ./db/migrations:/migrations
+      - ./db/migrations/tests:/tests
+    env_file: .env
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_USER: ${TEST_DB_USER}
+      POSTGRES_PASSWORD: ${TEST_DB_PASSWORD}
+      POSTGRES_DB: ${TEST_DB_NAME}
+    command: >
+      bash -c "
+      docker-entrypoint.sh postgres &
+      until pg_isready -U $${POSTGRES_USER} -d $${TEST_DB_NAME}; do sleep 2; done;
+      ./tests/idempotency_tests.sh;
+      "
+    networks:
+      - app-network
+
+volumes:
+  grafana_data:
+
+networks:
+  app-network:
